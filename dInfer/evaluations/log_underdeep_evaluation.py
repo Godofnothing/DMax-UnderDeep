@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Publish the final lm-eval and dInfer speed results to an Underdeep run.
+"""Publish the final postprocessed accuracy and dInfer speed results to Underdeep.
 
-The evaluator writes the speed summary and lm-eval's result table to stdout, so
-this small post-processing step intentionally consumes the tee'd evaluation log.
-Keeping it outside the model worker also ensures only one process creates an
-Underdeep run for tensor-parallel evaluations.
+The evaluator writes the speed summary to stdout and the task-specific ``val_*.py``
+script writes the authoritative accuracy to a second log. Keeping this outside
+the model worker also ensures only one process creates an Underdeep run for
+tensor-parallel evaluations.
 """
 
 from __future__ import annotations
@@ -26,6 +26,7 @@ SPEED_RE = re.compile(
     r"TPS:\s*(?P<TPS>[-+0-9.eE]+)\s*,\s*"
     r"TPF:\s*(?P<TPF>[-+0-9.eE]+)"
 )
+ACCURACY_RE = re.compile(r"^Accuracy:\s*(?P<Accuracy>[-+0-9.eE]+)%\s*$", re.MULTILINE)
 
 
 def _metric_key(value: str) -> str:
@@ -33,7 +34,7 @@ def _metric_key(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", value.strip()).strip("_")
 
 
-def _read_metrics(log_path: Path) -> dict[str, float | int]:
+def _read_metrics(log_path: Path, score_log_path: Path | None = None) -> dict[str, float | int]:
     text = log_path.read_text(encoding="utf-8", errors="replace")
     matches = list(SPEED_RE.finditer(text))
     if not matches:
@@ -45,6 +46,17 @@ def _read_metrics(log_path: Path) -> dict[str, float | int]:
         if not math.isfinite(parsed):
             raise ValueError(f"Invalid {name} value in {log_path}: {value}")
         values[name] = parsed
+
+    if score_log_path is not None:
+        score_text = score_log_path.read_text(encoding="utf-8", errors="replace")
+        score_matches = list(ACCURACY_RE.finditer(score_text))
+        if not score_matches:
+            raise ValueError(f"No postprocessed accuracy found in {score_log_path}")
+        accuracy = float(score_matches[-1].group("Accuracy")) / 100.0
+        if not math.isfinite(accuracy):
+            raise ValueError(f"Invalid Accuracy value in {score_log_path}")
+        values["Accuracy"] = accuracy
+        return values
 
     # lm-eval prints rows in a Markdown table.  Column 0 can be empty when it
     # repeats the previous task, hence current_task is retained across rows.
@@ -89,12 +101,20 @@ def main() -> None:
     parser.add_argument("--experiment", required=True)
     parser.add_argument("--task", required=True)
     parser.add_argument("--log", required=True, type=Path)
+    parser.add_argument(
+        "--score-log",
+        type=Path,
+        default=None,
+        help="Log produced by the task-specific val_*.py postprocessor.",
+    )
     parser.add_argument("--run-name", default=None)
     parser.add_argument("--parameters-json", default="{}")
     args = parser.parse_args()
 
     if not args.log.is_file():
         raise SystemExit(f"Evaluation log does not exist: {args.log}")
+    if args.score_log is not None and not args.score_log.is_file():
+        raise SystemExit(f"Postprocessing log does not exist: {args.score_log}")
     try:
         parameters: dict[str, Any] = json.loads(args.parameters_json)
     except json.JSONDecodeError as error:
@@ -102,9 +122,11 @@ def main() -> None:
     if not isinstance(parameters, dict):
         raise SystemExit("--parameters-json must be a JSON object")
 
-    metrics = _read_metrics(args.log)
+    metrics = _read_metrics(args.log, args.score_log)
     revision = _git_revision()
     parameters.update({"task": args.task, "evaluation_log": str(args.log)})
+    if args.score_log is not None:
+        parameters["postprocessing_log"] = str(args.score_log)
     if revision:
         parameters["git_revision"] = revision
     run_name = args.run_name or f"dmax-{args.task}-{dt.datetime.now(dt.timezone.utc):%Y%m%dT%H%M%SZ}"

@@ -41,7 +41,34 @@ if [ "$parallel" = "tp" ]; then
       --confirm_run_unsafe_code --model dInfer_eval \
       --model_args model_path="${model_path}",gen_length="${length}",block_length="${block_length}",threshold="${threshold}",low_threshold="${low_threshold}",show_speed=True,save_dir="${output_path}",parallel_decoding="${parallel_decoding}",cache="${cache}",warmup_times="${warmup_times}",use_compile="${use_compile}",tp_size="${tp_size}",parallel="${parallel}",cont_weight="${cont_weight}",use_credit="${use_credit}",prefix_look="${prefix_look}",after_look="${after_look}",gpus="${gpus}",model_type="${model_type}",use_bd="${use_bd}",master_port="${master_port}",save_samples="${save_samples}" \
       --output_path "${output_path}" --include_path tasks --apply_chat_template 2>&1 | tee "${eval_log}"; then
-      underdeep_args=(--project dllm --experiment "${underdeep_experiment}" --task "${task}" --log "${eval_log}")
+      case "${task}" in
+        gsm8k_llada_mini)
+          validator="val_gsm8k.py"
+          ;;
+        minerva_math500)
+          validator="val_math.py"
+          ;;
+        minerva_math_algebra)
+          validator="val_algebra.py"
+          ;;
+        asdiv_llada_mini)
+          validator="val_asdiv.py"
+          ;;
+        *)
+          echo "No postprocessor configured for task: ${task}" >&2
+          exit 1
+          ;;
+      esac
+
+      score_log="${output_path}/postprocess.log"
+      if python "${SCRIPT_DIR}/${validator}" \
+        --pred-path "${output_path}/rank_0.jsonl" 2>&1 | tee "${score_log}"; then
+        :
+      else
+        exit $?
+      fi
+
+      underdeep_args=(--project dllm --experiment "${underdeep_experiment}" --task "${task}" --log "${eval_log}" --score-log "${score_log}")
       if [ -n "${underdeep_run_name}" ]; then
         underdeep_args+=(--run-name "${underdeep_run_name}")
       fi
